@@ -1,0 +1,26 @@
+# Java / Maven
+target/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / logs
+.env
+*.log
+
+# Data files
+sample-data/*.csv
+sample-data/*.parquet
+sample-data/*.zip
+
+# Local generated files
+*.tmp
