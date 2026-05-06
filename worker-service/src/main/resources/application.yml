@@ -1,9 +1,9 @@
 server:
-  port: 8080
+  port: 8081
 
 spring:
   application:
-    name: api-service
+    name: worker-service
 
   datasource:
     url: jdbc:postgresql://localhost:5432/jobsdb
@@ -17,3 +17,6 @@ spring:
 
   kafka:
     bootstrap-servers: localhost:9092
+    consumer:
+      group-id: job-worker-group
+      auto-offset-reset: earliest
