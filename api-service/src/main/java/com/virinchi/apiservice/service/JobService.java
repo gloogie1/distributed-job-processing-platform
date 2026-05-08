@@ -14,6 +14,9 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.virinchi.apiservice.dto.ValidationErrorResponse;
+import com.virinchi.apiservice.entity.ValidationError;
+import com.virinchi.apiservice.repository.ValidationErrorRepository;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -32,7 +35,9 @@ public class JobService {
 
     private final JobRepository jobRepository;
     private final JobChunkRepository jobChunkRepository;
+    private final ValidationErrorRepository validationErrorRepository;
     private final KafkaTemplate<String, ChunkMessage> kafkaTemplate;
+    
 
     @Transactional
     public JobResponse createJob(CreateJobRequest request) {
@@ -118,6 +123,13 @@ public class JobService {
                 .toList();
     }
 
+    public List<ValidationErrorResponse> getValidationErrors(UUID jobId) {
+    return validationErrorRepository.findByJobIdOrderByRowNumberAsc(jobId)
+            .stream()
+            .map(this::toValidationErrorResponse)
+            .toList();
+    }
+
     private long countDataRows(Path filePath) {
         try (Stream<String> lines = Files.lines(filePath)) {
             long totalLines = lines.count();
@@ -174,6 +186,20 @@ public class JobService {
                 chunk.getLastError()
         );
     }
+
+    private ValidationErrorResponse toValidationErrorResponse(ValidationError error) {
+    return new ValidationErrorResponse(
+            error.getId(),
+            error.getJobId(),
+            error.getChunkId(),
+            error.getRowNumber(),
+            error.getFieldName(),
+            error.getInvalidValue(),
+            error.getErrorCode(),
+            error.getErrorMessage(),
+            error.getCreatedAt()
+    );
+}
 
     private record RowRange(long startRow, long endRow) {
     }

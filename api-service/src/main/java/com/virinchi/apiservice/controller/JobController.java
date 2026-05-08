@@ -3,6 +3,7 @@ package com.virinchi.apiservice.controller;
 import com.virinchi.apiservice.dto.CreateJobRequest;
 import com.virinchi.apiservice.dto.JobChunkResponse;
 import com.virinchi.apiservice.dto.JobResponse;
+import com.virinchi.apiservice.dto.ValidationErrorResponse;
 import com.virinchi.apiservice.service.JobService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -31,5 +32,10 @@ public class JobController {
     @GetMapping("/{jobId}/chunks")
     public List<JobChunkResponse> getJobChunks(@PathVariable UUID jobId) {
         return jobService.getJobChunks(jobId);
+    }
+
+    @GetMapping("/{jobId}/errors")
+    public List<ValidationErrorResponse> getValidationErrors(@PathVariable UUID jobId) {
+        return jobService.getValidationErrors(jobId);
     }
 }
