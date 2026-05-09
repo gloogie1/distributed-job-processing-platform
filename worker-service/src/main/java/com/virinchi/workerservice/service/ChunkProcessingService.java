@@ -52,7 +52,13 @@ public class ChunkProcessingService {
 
         chunk.setStatus(ChunkStatus.PROCESSING);
         chunk.setStartedAt(Instant.now());
+        chunk.setLastError(null);
         jobChunkRepository.save(chunk);
+
+        // Idempotency hardening:
+        // If this chunk was partially processed before a crash/retry,
+        // remove old row-level errors before recomputing them.
+        validationErrorRepository.deleteByChunkId(chunk.getId());
 
         try {
             ChunkValidationResult result = validateRowsInRange(

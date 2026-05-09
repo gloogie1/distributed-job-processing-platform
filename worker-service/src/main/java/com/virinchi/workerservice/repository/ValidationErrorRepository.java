@@ -9,4 +9,6 @@ import java.util.UUID;
 public interface ValidationErrorRepository extends JpaRepository<ValidationError, UUID> {
 
     List<ValidationError> findByJobIdOrderByRowNumberAsc(UUID jobId);
+
+    void deleteByChunkId(UUID chunkId);
 }
