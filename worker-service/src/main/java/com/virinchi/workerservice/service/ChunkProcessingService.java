@@ -6,11 +6,13 @@ import com.virinchi.workerservice.entity.JobChunk;
 import com.virinchi.workerservice.entity.JobStatus;
 import com.virinchi.workerservice.entity.ValidationError;
 import com.virinchi.workerservice.messaging.ChunkMessage;
+import com.virinchi.workerservice.messaging.DlqMessage;
 import com.virinchi.workerservice.repository.JobChunkRepository;
 import com.virinchi.workerservice.repository.JobRepository;
 import com.virinchi.workerservice.repository.ValidationErrorRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,6 +35,13 @@ public class ChunkProcessingService {
     private final JobRepository jobRepository;
     private final JobChunkRepository jobChunkRepository;
     private final ValidationErrorRepository validationErrorRepository;
+    private final KafkaTemplate<String, DlqMessage> dlqMessageKafkaTemplate;
+    private final KafkaTemplate<String, ChunkMessage> chunkMessageKafkaTemplate;
+    
+    private static final int MAX_RETRIES = 3;
+    private static final String JOB_CHUNKS_TOPIC = "job-chunks";
+    private static final String JOB_CHUNKS_DLQ_TOPIC = "job-chunks-dlq";
+    
 
     @KafkaListener(
             topics = "job-chunks",
@@ -61,6 +70,9 @@ public class ChunkProcessingService {
         validationErrorRepository.deleteByChunkId(chunk.getId());
 
         try {
+            if (message.filePath().contains("force_fail")) {
+                throw new RuntimeException("Forced failure for DLQ testing");
+            }
             ChunkValidationResult result = validateRowsInRange(
                     Path.of(message.filePath()),
                     message.jobId(),
@@ -84,12 +96,46 @@ public class ChunkProcessingService {
             updateParentJob(message.jobId());
 
         } catch (Exception e) {
-            chunk.setStatus(ChunkStatus.FAILED_RETRYABLE);
-            chunk.setRetryCount(chunk.getRetryCount() + 1);
+            int nextRetryCount = chunk.getRetryCount() + 1;
+
+            chunk.setRetryCount(nextRetryCount);
             chunk.setLastError(e.getMessage());
+
+            if (nextRetryCount >= MAX_RETRIES) {
+                chunk.setStatus(ChunkStatus.FAILED_PERMANENT);
+                chunk.setCompletedAt(Instant.now());
+                jobChunkRepository.save(chunk);
+
+                DlqMessage dlqMessage = new DlqMessage(
+                    message.jobId(),
+                    message.chunkId(),
+                    message.filePath(),
+                    message.startRow(),
+                    message.endRow(),
+                    nextRetryCount,
+                    e.getMessage(),
+                    Instant.now()
+                );
+
+                dlqMessageKafkaTemplate.send(
+                    JOB_CHUNKS_DLQ_TOPIC,
+                    message.chunkId().toString(),
+                    dlqMessage
+                );
+
+                updateParentJob(message.jobId());
+                return;
+            }
+
+            chunk.setStatus(ChunkStatus.FAILED_RETRYABLE);
             jobChunkRepository.save(chunk);
 
-            throw new RuntimeException("Failed to process chunk " + message.chunkId(), e);
+            chunkMessageKafkaTemplate.send(
+                JOB_CHUNKS_TOPIC,
+                message.chunkId().toString(),
+                message
+            );
+            return;
         }
     }
 
