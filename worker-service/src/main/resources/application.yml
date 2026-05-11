@@ -20,3 +20,9 @@ spring:
     consumer:
       group-id: job-worker-group
       auto-offset-reset: earliest
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics

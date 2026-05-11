@@ -16,6 +16,11 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.beans.factory.annotation.Value;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import jakarta.annotation.PostConstruct;
+
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -28,6 +33,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
@@ -38,6 +44,7 @@ public class ChunkProcessingService {
     private final ValidationErrorRepository validationErrorRepository;
     private final KafkaTemplate<String, DlqMessage> dlqMessageKafkaTemplate;
     private final KafkaTemplate<String, ChunkMessage> chunkMessageKafkaTemplate;
+    private final MeterRegistry meterRegistry;
 
     @Value("${worker.instance-id:${spring.application.name}-${server.port}}")
     private String workerId;
@@ -45,6 +52,12 @@ public class ChunkProcessingService {
     private static final int MAX_RETRIES = 3;
     private static final String JOB_CHUNKS_TOPIC = "job-chunks";
     private static final String JOB_CHUNKS_DLQ_TOPIC = "job-chunks-dlq";
+
+    private Counter chunksCompletedCounter;
+    private Counter chunksFailedCounter;
+    private Counter rowsValidatedCounter;
+    private Counter validationErrorsCounter;
+    private Timer chunkProcessingTimer;
     
 
     @KafkaListener(
@@ -63,6 +76,7 @@ public class ChunkProcessingService {
             return;
         }
 
+        long startNanos = System.nanoTime();
         chunk.setStatus(ChunkStatus.PROCESSING);
         chunk.setStartedAt(Instant.now());
         chunk.setLastError(null);
@@ -95,6 +109,11 @@ public class ChunkProcessingService {
             chunk.setLastError(null);
             jobChunkRepository.save(chunk);
 
+            chunksCompletedCounter.increment();
+            rowsValidatedCounter.increment(result.validRows() + result.invalidRows());
+            validationErrorsCounter.increment(result.errors().size());
+            chunkProcessingTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+
             updateParentJob(message.jobId());
 
         } catch (Exception e) {
@@ -124,6 +143,9 @@ public class ChunkProcessingService {
                     message.chunkId().toString(),
                     dlqMessage
                 );
+                
+                chunksFailedCounter.increment();
+                chunkProcessingTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
 
                 updateParentJob(message.jobId());
                 return;
@@ -456,6 +478,29 @@ public class ChunkProcessingService {
 
         jobRepository.save(job);
     }
+
+    @PostConstruct
+    public void initMetrics() {
+        this.chunksCompletedCounter = Counter.builder("worker.chunks.completed")
+            .description("Number of chunks completed successfully")
+            .register(meterRegistry);
+
+        this.chunksFailedCounter = Counter.builder("worker.chunks.failed")
+            .description("Number of chunks permanently failed")
+            .register(meterRegistry);
+
+        this.rowsValidatedCounter = Counter.builder("worker.rows.validated")
+            .description("Number of rows validated by the worker")
+            .register(meterRegistry);
+
+        this.validationErrorsCounter = Counter.builder("worker.validation.errors")
+            .description("Number of validation errors generated")
+            .register(meterRegistry);
+
+        this.chunkProcessingTimer = Timer.builder("worker.chunk.processing.duration")
+            .description("Time taken to process a chunk")
+            .register(meterRegistry);
+}
 
     private record ChunkValidationResult(
             long validRows,
