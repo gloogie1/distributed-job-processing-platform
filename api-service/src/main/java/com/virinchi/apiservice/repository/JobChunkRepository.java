@@ -9,7 +9,7 @@ import java.util.UUID;
 
 public interface JobChunkRepository extends JpaRepository<JobChunk, UUID> {
 
-    List<JobChunk> findByJobId(UUID jobId);
+    List<JobChunk> findByJobIdOrderByStartRowAsc(UUID jobId);
 
     long countByJobIdAndStatus(UUID jobId, ChunkStatus status);
 }

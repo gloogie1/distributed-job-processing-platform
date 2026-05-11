@@ -117,10 +117,10 @@ public class JobService {
     }
 
     public List<JobChunkResponse> getJobChunks(UUID jobId) {
-        return jobChunkRepository.findByJobId(jobId)
-                .stream()
-                .map(this::toJobChunkResponse)
-                .toList();
+        return jobChunkRepository.findByJobIdOrderByStartRowAsc(jobId)
+            .stream()
+            .map(this::toJobChunkResponse)
+            .toList();
     }
 
     public List<ValidationErrorResponse> getValidationErrors(UUID jobId) {
