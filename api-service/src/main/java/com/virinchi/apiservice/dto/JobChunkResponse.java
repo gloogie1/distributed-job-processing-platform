@@ -13,6 +13,7 @@ public record JobChunkResponse(
         long endRow,
         ChunkStatus status,
         int retryCount,
+        String workerId,
         long validRows,
         long invalidRows,
         Instant createdAt,

@@ -15,6 +15,7 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.beans.factory.annotation.Value;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -37,6 +38,9 @@ public class ChunkProcessingService {
     private final ValidationErrorRepository validationErrorRepository;
     private final KafkaTemplate<String, DlqMessage> dlqMessageKafkaTemplate;
     private final KafkaTemplate<String, ChunkMessage> chunkMessageKafkaTemplate;
+
+    @Value("${worker.instance-id:${spring.application.name}-${server.port}}")
+    private String workerId;
     
     private static final int MAX_RETRIES = 3;
     private static final String JOB_CHUNKS_TOPIC = "job-chunks";
@@ -62,6 +66,7 @@ public class ChunkProcessingService {
         chunk.setStatus(ChunkStatus.PROCESSING);
         chunk.setStartedAt(Instant.now());
         chunk.setLastError(null);
+        chunk.setWorkerId(workerId);
         jobChunkRepository.save(chunk);
 
         // Idempotency hardening:
@@ -70,9 +75,6 @@ public class ChunkProcessingService {
         validationErrorRepository.deleteByChunkId(chunk.getId());
 
         try {
-            if (message.filePath().contains("force_fail")) {
-                throw new RuntimeException("Forced failure for DLQ testing");
-            }
             ChunkValidationResult result = validateRowsInRange(
                     Path.of(message.filePath()),
                     message.jobId(),
@@ -135,6 +137,7 @@ public class ChunkProcessingService {
                 message.chunkId().toString(),
                 message
             );
+            
             return;
         }
     }

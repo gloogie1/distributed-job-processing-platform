@@ -34,6 +34,7 @@ public class JobChunk {
     @Column(nullable = false)
     private ChunkStatus status;
 
+    private String workerId;
     private int retryCount;
 
     private long validRows;

@@ -35,6 +35,8 @@ public class JobChunk {
     private ChunkStatus status;
 
     private int retryCount;
+    
+    private String workerId;
 
     private long validRows;
     private long invalidRows;

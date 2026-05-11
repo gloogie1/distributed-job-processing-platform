@@ -178,6 +178,7 @@ public class JobService {
                 chunk.getEndRow(),
                 chunk.getStatus(),
                 chunk.getRetryCount(),
+                chunk.getWorkerId(),
                 chunk.getValidRows(),
                 chunk.getInvalidRows(),
                 chunk.getCreatedAt(),
