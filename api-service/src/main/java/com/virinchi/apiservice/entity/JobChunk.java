@@ -25,6 +25,9 @@ public class JobChunk {
     private String filePath;
 
     @Column(nullable = false)
+    private String chunkFilePath;
+
+    @Column(nullable = false)
     private long startRow;
 
     @Column(nullable = false)

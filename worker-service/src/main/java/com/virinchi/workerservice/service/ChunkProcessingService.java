@@ -46,10 +46,11 @@ public class ChunkProcessingService {
     private final KafkaTemplate<String, ChunkMessage> chunkMessageKafkaTemplate;
     private final MeterRegistry meterRegistry;
 
-    @Value("${worker.instance-id:${spring.application.name}-${server.port}}")
-    private String workerId;
+    @Value("${worker.instance-id:${HOSTNAME:worker-unknown}}")
+    private String workerId;;
     
     private static final int MAX_RETRIES = 3;
+    private static final int MAX_VALIDATION_ERRORS_PER_CHUNK = 100;
     private static final String JOB_CHUNKS_TOPIC = "job-chunks";
     private static final String JOB_CHUNKS_DLQ_TOPIC = "job-chunks-dlq";
 
@@ -89,12 +90,11 @@ public class ChunkProcessingService {
         validationErrorRepository.deleteByChunkId(chunk.getId());
 
         try {
-            ChunkValidationResult result = validateRowsInRange(
-                    Path.of(message.filePath()),
-                    message.jobId(),
-                    message.chunkId(),
-                    message.startRow(),
-                    message.endRow()
+            ChunkValidationResult result = validateChunkFile(
+                Path.of(message.chunkFilePath()),
+                message.jobId(),
+                message.chunkId(),
+                message.startRow()
             );
 
             chunk.setValidRows(result.validRows());
@@ -199,6 +199,47 @@ public class ChunkProcessingService {
                     validRows++;
                 } else {
                     invalidRows++;
+
+                    for (ValidationError error : rowErrors) {
+                        if (errors.size() >= MAX_VALIDATION_ERRORS_PER_CHUNK) {
+                        break;
+                    }
+                        errors.add(error);
+                    }
+                }
+            }
+        }
+
+        return new ChunkValidationResult(validRows, invalidRows, errors);
+    }
+
+    private ChunkValidationResult validateChunkFile(
+        Path chunkFilePath,
+        UUID jobId,
+        UUID chunkId,
+        long chunkStartRow
+    ) throws IOException {
+        long validRows = 0;
+        long invalidRows = 0;
+        long rowOffset = 0;
+
+        List<ValidationError> errors = new ArrayList<>();
+
+        try (BufferedReader reader = Files.newBufferedReader(chunkFilePath)) {
+            // Skip header
+            reader.readLine();
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                long originalRowNumber = chunkStartRow + rowOffset;
+                rowOffset++;
+
+                List<ValidationError> rowErrors = validateRow(line, jobId, chunkId, originalRowNumber);
+
+                if (rowErrors.isEmpty()) {
+                    validRows++;
+                } else {
+                    invalidRows++;
                     errors.addAll(rowErrors);
                 }
             }
@@ -206,6 +247,8 @@ public class ChunkProcessingService {
 
         return new ChunkValidationResult(validRows, invalidRows, errors);
     }
+
+
 
     private List<ValidationError> validateRow(String line, UUID jobId, UUID chunkId, long rowNumber) {
         List<ValidationError> errors = new ArrayList<>();

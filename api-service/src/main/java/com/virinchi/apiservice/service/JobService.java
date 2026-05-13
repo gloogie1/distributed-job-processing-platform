@@ -10,15 +10,19 @@ import com.virinchi.apiservice.entity.JobStatus;
 import com.virinchi.apiservice.messaging.ChunkMessage;
 import com.virinchi.apiservice.repository.JobChunkRepository;
 import com.virinchi.apiservice.repository.JobRepository;
+import com.virinchi.apiservice.dto.ValidationErrorResponse;
+import com.virinchi.apiservice.entity.ValidationError;
+import com.virinchi.apiservice.repository.ValidationErrorRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import com.virinchi.apiservice.dto.ValidationErrorResponse;
-import com.virinchi.apiservice.entity.ValidationError;
-import com.virinchi.apiservice.repository.ValidationErrorRepository;
+
 
 import java.io.IOException;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -41,63 +45,68 @@ public class JobService {
 
     @Transactional
     public JobResponse createJob(CreateJobRequest request) {
-        Path filePath = Path.of(request.filePath());
+        Path sourceFilePath = Path.of(request.filePath());
 
-        if (!Files.exists(filePath)) {
+        if (!Files.exists(sourceFilePath)) {
             throw new IllegalArgumentException("File does not exist: " + request.filePath());
         }
-
-        long totalRows = countDataRows(filePath);
-        List<RowRange> ranges = splitIntoChunks(totalRows, request.chunkSize());
 
         UUID jobId = UUID.randomUUID();
         Instant now = Instant.now();
 
+        ChunkCreationResult chunkCreationResult = createPhysicalChunkFiles(
+            sourceFilePath,
+            jobId,
+            request.chunkSize()
+        );
+
         Job job = Job.builder()
-                .id(jobId)
-                .filePath(request.filePath())
-                .status(JobStatus.PENDING)
-                .totalChunks(ranges.size())
-                .completedChunks(0)
-                .failedChunks(0)
-                .totalRows(totalRows)
-                .validRows(0)
-                .invalidRows(0)
-                .createdAt(now)
-                .build();
+            .id(jobId)
+            .filePath(request.filePath())
+            .status(JobStatus.PENDING)
+            .totalChunks(chunkCreationResult.chunks().size())
+            .completedChunks(0)
+            .failedChunks(0)
+            .totalRows(chunkCreationResult.totalRows())
+            .validRows(0)
+            .invalidRows(0)
+            .createdAt(now)
+            .build();
 
         jobRepository.save(job);
 
         List<JobChunk> chunks = new ArrayList<>();
 
-        for (RowRange range : ranges) {
+        for (ChunkFileInfo chunkFileInfo : chunkCreationResult.chunks()) {
             UUID chunkId = UUID.randomUUID();
 
             JobChunk chunk = JobChunk.builder()
-                    .id(chunkId)
-                    .jobId(jobId)
-                    .filePath(request.filePath())
-                    .startRow(range.startRow())
-                    .endRow(range.endRow())
-                    .status(ChunkStatus.PENDING)
-                    .retryCount(0)
-                    .validRows(0)
-                    .invalidRows(0)
-                    .createdAt(now)
-                    .build();
+                .id(chunkId)
+                .jobId(jobId)
+                .filePath(request.filePath())
+                .chunkFilePath(chunkFileInfo.chunkFilePath())
+                .startRow(chunkFileInfo.startRow())
+                .endRow(chunkFileInfo.endRow())
+                .status(ChunkStatus.PENDING)
+                .retryCount(0)
+                .validRows(0)
+                .invalidRows(0)
+                .createdAt(now)
+                .build();
 
             chunks.add(chunk);
         }
-
+    
         jobChunkRepository.saveAll(chunks);
 
         for (JobChunk chunk : chunks) {
             ChunkMessage message = new ChunkMessage(
-                    jobId,
-                    chunk.getId(),
-                    chunk.getFilePath(),
-                    chunk.getStartRow(),
-                    chunk.getEndRow()
+                jobId,
+                chunk.getId(),
+                chunk.getFilePath(),
+                chunk.getChunkFilePath(),
+                chunk.getStartRow(),
+                chunk.getEndRow()
             );
 
             kafkaTemplate.send(JOB_CHUNKS_TOPIC, chunk.getId().toString(), message);
@@ -174,6 +183,7 @@ public class JobService {
                 chunk.getId(),
                 chunk.getJobId(),
                 chunk.getFilePath(),
+                chunk.getChunkFilePath(),
                 chunk.getStartRow(),
                 chunk.getEndRow(),
                 chunk.getStatus(),
@@ -189,7 +199,7 @@ public class JobService {
     }
 
     private ValidationErrorResponse toValidationErrorResponse(ValidationError error) {
-    return new ValidationErrorResponse(
+        return new ValidationErrorResponse(
             error.getId(),
             error.getJobId(),
             error.getChunkId(),
@@ -199,8 +209,123 @@ public class JobService {
             error.getErrorCode(),
             error.getErrorMessage(),
             error.getCreatedAt()
-    );
-}
+        );
+    }
+    private ChunkCreationResult createPhysicalChunkFiles(
+        Path sourceFilePath,
+        UUID jobId,
+        long chunkSize
+    ) {
+        List<ChunkFileInfo> chunkFiles = new ArrayList<>();
+
+        Path chunksDir = sourceFilePath.getParent()
+            .resolve("chunks")
+            .resolve(jobId.toString());
+
+        try {
+            Files.createDirectories(chunksDir);
+
+            try (BufferedReader reader = Files.newBufferedReader(sourceFilePath)) {
+                String header = reader.readLine();
+
+                if (header == null) {
+                    return new ChunkCreationResult(0, chunkFiles);
+                }
+
+                long totalRows = 0;
+                long currentChunkRowCount = 0;
+                long chunkStartRow = 1;
+                int chunkNumber = 1;
+
+                BufferedWriter writer = null;
+                Path currentChunkPath = null;
+
+                try {
+                    String line;
+
+                    while ((line = reader.readLine()) != null) {
+                        totalRows++;
+
+                        if (writer == null || currentChunkRowCount >= chunkSize) {
+                            if (writer != null) {
+                                writer.close();
+
+                                chunkFiles.add(new ChunkFileInfo(
+                                    toContainerPath(currentChunkPath),
+                                    chunkStartRow,
+                                    totalRows - 1
+                                ));
+                            }
+
+                            currentChunkPath = chunksDir.resolve(
+                                String.format("chunk-%06d.csv", chunkNumber)
+                            );
+
+                            writer = Files.newBufferedWriter(
+                                currentChunkPath,
+                                StandardOpenOption.CREATE,
+                                StandardOpenOption.TRUNCATE_EXISTING
+                            );
+
+                            writer.write(header);
+                            writer.newLine();
+
+                            chunkStartRow = totalRows;
+                            currentChunkRowCount = 0;
+                            chunkNumber++;
+                        }
+
+                        writer.write(line);
+                        writer.newLine();
+                        currentChunkRowCount++;
+                    }
+
+                    if (writer != null) {
+                        writer.close();
+
+                        chunkFiles.add(new ChunkFileInfo(
+                            toContainerPath(currentChunkPath),
+                            chunkStartRow,
+                            totalRows
+                        ));
+                    }
+
+                    return new ChunkCreationResult(totalRows, chunkFiles);
+
+                } finally {
+                    if (writer != null) {
+                        writer.close();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create chunk files for: " + sourceFilePath, e);
+        }
+    }
+
+    private String toContainerPath(Path path) {
+        String normalized = path.toString().replace("\\", "/");
+
+        int dataIndex = normalized.indexOf("/data/");
+        if (dataIndex >= 0) {
+            return normalized.substring(dataIndex);
+        }
+
+        return normalized;
+    }
+
+    private record ChunkCreationResult(
+        long totalRows,
+        List<ChunkFileInfo> chunks
+    ) {
+    }
+
+    private record ChunkFileInfo(
+        String chunkFilePath,
+        long startRow,
+        long endRow
+    ) {
+    }
 
     private record RowRange(long startRow, long endRow) {
     }

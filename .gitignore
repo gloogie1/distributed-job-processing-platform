@@ -21,6 +21,6 @@ Thumbs.db
 sample-data/*.csv
 sample-data/*.parquet
 sample-data/*.zip
-
+sample-data/chunks/
 # Local generated files
 *.tmp

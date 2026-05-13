@@ -6,6 +6,7 @@ public record ChunkMessage(
         UUID jobId,
         UUID chunkId,
         String filePath,
+        String chunkFilePath,
         long startRow,
         long endRow
 ) {

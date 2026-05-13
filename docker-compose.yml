@@ -62,18 +62,14 @@ services:
   worker-service:
     build:
       context: ./worker-service
-    container_name: djp-worker-service
     depends_on:
       - postgres
       - kafka
-    ports:
-      - "8081:8081"
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/jobsdb
       SPRING_DATASOURCE_USERNAME: jobuser
       SPRING_DATASOURCE_PASSWORD: jobpass
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      WORKER_INSTANCE_ID: worker-docker-1
     volumes:
       - ./sample-data:/data
 

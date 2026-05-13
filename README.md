@@ -261,6 +261,42 @@ Health check:
 http://localhost:8081/actuator/health
 ```
 
+## Docker Compose Setup
+
+The full system can be started with Docker Compose:
+```powershell
+docker compose up -d --build
+```
+This starts:
+
+PostgreSQL
+Kafka
+Kafka UI
+API service
+Worker service
+
+When using Docker Compose, sample files are mounted into the API and worker containers at:
+```text
+/data
+```
+So job requests should use container paths, for example:
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8080/jobs" `
+  -ContentType "application/json" `
+  -Body '{"filePath":"/data/sample_trips.csv","chunkSize":1}'
+```
+Check job status:
+```powershell
+Invoke-RestMethod -Method Get `
+  -Uri "http://localhost:8080/jobs/YOUR_JOB_ID"
+```
+Check chunks:
+```powershell
+Invoke-RestMethod -Method Get `
+  -Uri "http://localhost:8080/jobs/YOUR_JOB_ID/chunks"
+```
+
 ## API Endpoints
 
 ### Create job
