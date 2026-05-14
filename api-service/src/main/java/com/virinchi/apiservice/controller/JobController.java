@@ -38,4 +38,9 @@ public class JobController {
     public List<ValidationErrorResponse> getValidationErrors(@PathVariable UUID jobId) {
         return jobService.getValidationErrors(jobId);
     }
+
+    @GetMapping
+    public List<JobResponse> getRecentJobs() {
+        return jobService.getRecentJobs();
+    }
 }

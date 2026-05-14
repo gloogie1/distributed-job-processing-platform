@@ -133,9 +133,17 @@ public class JobService {
     }
 
     public List<ValidationErrorResponse> getValidationErrors(UUID jobId) {
-    return validationErrorRepository.findByJobIdOrderByRowNumberAsc(jobId)
+        return validationErrorRepository.findByJobIdOrderByRowNumberAsc(jobId)
             .stream()
             .map(this::toValidationErrorResponse)
+            .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<JobResponse> getRecentJobs() {
+        return jobRepository.findTop25ByOrderByCreatedAtDesc()
+            .stream()
+            .map(this::toJobResponse)
             .toList();
     }
 
