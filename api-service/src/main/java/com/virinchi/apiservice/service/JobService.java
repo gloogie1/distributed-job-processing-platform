@@ -7,16 +7,21 @@ import com.virinchi.apiservice.entity.ChunkStatus;
 import com.virinchi.apiservice.entity.Job;
 import com.virinchi.apiservice.entity.JobChunk;
 import com.virinchi.apiservice.entity.JobStatus;
+import com.virinchi.apiservice.entity.OutboxEvent;
+import com.virinchi.apiservice.entity.OutboxStatus;
 import com.virinchi.apiservice.messaging.ChunkMessage;
 import com.virinchi.apiservice.repository.JobChunkRepository;
 import com.virinchi.apiservice.repository.JobRepository;
 import com.virinchi.apiservice.dto.ValidationErrorResponse;
 import com.virinchi.apiservice.entity.ValidationError;
 import com.virinchi.apiservice.repository.ValidationErrorRepository;
+import com.virinchi.apiservice.repository.OutboxEventRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 
 import java.io.IOException;
@@ -40,7 +45,8 @@ public class JobService {
     private final JobRepository jobRepository;
     private final JobChunkRepository jobChunkRepository;
     private final ValidationErrorRepository validationErrorRepository;
-    private final KafkaTemplate<String, ChunkMessage> kafkaTemplate;
+    private final OutboxEventRepository outboxEventRepository;
+    private final ObjectMapper objectMapper;
     
 
     @Transactional
@@ -99,6 +105,8 @@ public class JobService {
     
         jobChunkRepository.saveAll(chunks);
 
+        List<OutboxEvent> outboxEvents = new ArrayList<>();
+
         for (JobChunk chunk : chunks) {
             ChunkMessage message = new ChunkMessage(
                 jobId,
@@ -109,8 +117,22 @@ public class JobService {
                 chunk.getEndRow()
             );
 
-            kafkaTemplate.send(JOB_CHUNKS_TOPIC, chunk.getId().toString(), message);
+            outboxEvents.add(OutboxEvent.builder()
+                .id(UUID.randomUUID())
+                .aggregateType("JOB_CHUNK")
+                .aggregateId(chunk.getId())
+                .eventType("CHUNK_CREATED")
+                .topic(JOB_CHUNKS_TOPIC)
+                .messageKey(chunk.getId().toString())
+                .payload(toJson(message))
+                .status(OutboxStatus.PENDING)
+                .retryCount(0)
+                .createdAt(now)
+                .build()
+            );
         }
+
+        outboxEventRepository.saveAll(outboxEvents);
 
         job.setStatus(JobStatus.RUNNING);
         jobRepository.save(job);
@@ -320,6 +342,14 @@ public class JobService {
         }
 
         return normalized;
+    }
+
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to serialize outbox payload", e);
+        }
     }
 
     private record ChunkCreationResult(

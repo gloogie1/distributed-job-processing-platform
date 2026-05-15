@@ -10,6 +10,7 @@ import com.virinchi.workerservice.messaging.DlqMessage;
 import com.virinchi.workerservice.repository.JobChunkRepository;
 import com.virinchi.workerservice.repository.JobRepository;
 import com.virinchi.workerservice.repository.ValidationErrorRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -42,12 +43,13 @@ public class ChunkProcessingService {
     private final JobRepository jobRepository;
     private final JobChunkRepository jobChunkRepository;
     private final ValidationErrorRepository validationErrorRepository;
+    private final ObjectMapper objectMapper;
     private final KafkaTemplate<String, DlqMessage> dlqMessageKafkaTemplate;
-    private final KafkaTemplate<String, ChunkMessage> chunkMessageKafkaTemplate;
+    private final KafkaTemplate<String, String> chunkMessageKafkaTemplate;
     private final MeterRegistry meterRegistry;
 
     @Value("${worker.instance-id:${HOSTNAME:worker-unknown}}")
-    private String workerId;;
+    private String workerId;
     
     private static final int MAX_RETRIES = 3;
     private static final int MAX_VALIDATION_ERRORS_PER_CHUNK = 100;
@@ -62,18 +64,31 @@ public class ChunkProcessingService {
     
 
     @KafkaListener(
-            topics = "job-chunks",
-            groupId = "job-worker-group",
-            containerFactory = "chunkMessageKafkaListenerContainerFactory"
+        topics = "job-chunks",
+        groupId = "job-worker-group",
+        containerFactory = "stringKafkaListenerContainerFactory"
     )
     @Transactional
-    public void processChunk(ChunkMessage message) {
+    public void processChunk(String payload) {
+        ChunkMessage message = parseChunkMessage(payload);
+        processChunkMessage(message);
+    }
+
+    private ChunkMessage parseChunkMessage(String payload) {
+        try {
+            return objectMapper.readValue(payload, ChunkMessage.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse ChunkMessage payload", e);
+        }
+    }
+
+    private void processChunkMessage(ChunkMessage message) { 
         JobChunk chunk = jobChunkRepository.findById(message.chunkId())
                 .orElseThrow(() -> new IllegalArgumentException("Chunk not found: " + message.chunkId()));
 
         // Basic idempotency guard.
         // If Kafka redelivers a message for an already completed chunk, skip it.
-        if (chunk.getStatus() == ChunkStatus.COMPLETED) {
+        if (chunk.getStatus() == ChunkStatus.COMPLETED ||chunk.getStatus() == ChunkStatus.FAILED_PERMANENT) {
             return;
         }
 
@@ -157,7 +172,7 @@ public class ChunkProcessingService {
             chunkMessageKafkaTemplate.send(
                 JOB_CHUNKS_TOPIC,
                 message.chunkId().toString(),
-                message
+                toJson(message)
             );
             
             return;
@@ -202,8 +217,8 @@ public class ChunkProcessingService {
 
                     for (ValidationError error : rowErrors) {
                         if (errors.size() >= MAX_VALIDATION_ERRORS_PER_CHUNK) {
-                        break;
-                    }
+                            break;
+                        }
                         errors.add(error);
                     }
                 }
@@ -550,5 +565,13 @@ public class ChunkProcessingService {
             long invalidRows,
             List<ValidationError> errors
     ) {
+    }
+
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize Kafka message", e);
+        }
     }
 }
