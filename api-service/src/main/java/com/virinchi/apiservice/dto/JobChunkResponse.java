@@ -10,6 +10,8 @@ public record JobChunkResponse(
         UUID jobId,
         String filePath,
         String chunkFilePath,
+        String validOutputPath,
+        String invalidOutputPath,
         long startRow,
         long endRow,
         ChunkStatus status,

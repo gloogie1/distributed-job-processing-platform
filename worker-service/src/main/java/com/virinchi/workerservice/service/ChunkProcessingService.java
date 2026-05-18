@@ -23,11 +23,13 @@ import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
 
 
+import java.io.BufferedWriter;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -105,7 +107,7 @@ public class ChunkProcessingService {
         validationErrorRepository.deleteByChunkId(chunk.getId());
 
         try {
-            ChunkValidationResult result = validateChunkFile(
+            ChunkValidationResult result = processChunkFileWithOutputs(
                 Path.of(message.chunkFilePath()),
                 message.jobId(),
                 message.chunkId(),
@@ -114,6 +116,8 @@ public class ChunkProcessingService {
 
             chunk.setValidRows(result.validRows());
             chunk.setInvalidRows(result.invalidRows());
+            chunk.setValidOutputPath(result.validOutputPath());
+            chunk.setInvalidOutputPath(result.invalidOutputPath());
 
             if (!result.errors().isEmpty()) {
                 validationErrorRepository.saveAll(result.errors());
@@ -179,56 +183,7 @@ public class ChunkProcessingService {
         }
     }
 
-    private ChunkValidationResult validateRowsInRange(
-            Path filePath,
-            UUID jobId,
-            UUID chunkId,
-            long startRow,
-            long endRow
-    ) throws IOException {
-        long validRows = 0;
-        long invalidRows = 0;
-        long currentDataRow = 0;
-
-        List<ValidationError> errors = new ArrayList<>();
-
-        try (BufferedReader reader = Files.newBufferedReader(filePath)) {
-            // Skip header
-            reader.readLine();
-
-            String line;
-            while ((line = reader.readLine()) != null) {
-                currentDataRow++;
-
-                if (currentDataRow < startRow) {
-                    continue;
-                }
-
-                if (currentDataRow > endRow) {
-                    break;
-                }
-
-                List<ValidationError> rowErrors = validateRow(line, jobId, chunkId, currentDataRow);
-
-                if (rowErrors.isEmpty()) {
-                    validRows++;
-                } else {
-                    invalidRows++;
-
-                    for (ValidationError error : rowErrors) {
-                        if (errors.size() >= MAX_VALIDATION_ERRORS_PER_CHUNK) {
-                            break;
-                        }
-                        errors.add(error);
-                    }
-                }
-            }
-        }
-
-        return new ChunkValidationResult(validRows, invalidRows, errors);
-    }
-
-    private ChunkValidationResult validateChunkFile(
+    private ChunkValidationResult processChunkFileWithOutputs(
         Path chunkFilePath,
         UUID jobId,
         UUID chunkId,
@@ -240,28 +195,87 @@ public class ChunkProcessingService {
 
         List<ValidationError> errors = new ArrayList<>();
 
-        try (BufferedReader reader = Files.newBufferedReader(chunkFilePath)) {
-            // Skip header
-            reader.readLine();
+        Path outputBaseDir = chunkFilePath.getParent()
+            .getParent()
+            .getParent()
+            .resolve("output")
+            .resolve(jobId.toString());
 
-            String line;
-            while ((line = reader.readLine()) != null) {
-                long originalRowNumber = chunkStartRow + rowOffset;
-                rowOffset++;
+        Path validOutputDir = outputBaseDir.resolve("valid");
+        Path invalidOutputDir = outputBaseDir.resolve("invalid");
 
-                List<ValidationError> rowErrors = validateRow(line, jobId, chunkId, originalRowNumber);
+        Files.createDirectories(validOutputDir);
+        Files.createDirectories(invalidOutputDir);
 
-                if (rowErrors.isEmpty()) {
-                    validRows++;
-                } else {
-                    invalidRows++;
-                    errors.addAll(rowErrors);
+        String chunkFileName = chunkFilePath.getFileName().toString().replace(".csv", "");
+        Path validOutputPath = validOutputDir.resolve(chunkFileName + "-valid.csv");
+        Path invalidOutputPath = invalidOutputDir.resolve(chunkFileName + "-invalid.csv");
+
+        try (
+            BufferedReader reader = Files.newBufferedReader(chunkFilePath);
+            BufferedWriter validWriter = Files.newBufferedWriter(
+                    validOutputPath,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING
+            );
+            BufferedWriter invalidWriter = Files.newBufferedWriter(
+                    invalidOutputPath,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING
+            )
+        ) {
+            String header = reader.readLine();
+
+            if (header == null) {
+                return new ChunkValidationResult(
+                    0,
+                    0,
+                    errors,
+                    toPortablePath(validOutputPath),
+                    toPortablePath(invalidOutputPath)
+            );
+        }
+
+        validWriter.write(header);
+        validWriter.newLine();
+
+        invalidWriter.write(header);
+        invalidWriter.newLine();
+
+        String line;
+        while ((line = reader.readLine()) != null) {
+            long originalRowNumber = chunkStartRow + rowOffset;
+            rowOffset++;
+
+            List<ValidationError> rowErrors = validateRow(line, jobId, chunkId, originalRowNumber);
+
+            if (rowErrors.isEmpty()) {
+                validRows++;
+                validWriter.write(line);
+                validWriter.newLine();
+            } else {
+                invalidRows++;
+                invalidWriter.write(line);
+                invalidWriter.newLine();
+
+                for (ValidationError error : rowErrors) {
+                    if (errors.size() >= MAX_VALIDATION_ERRORS_PER_CHUNK) {
+                        break;
+                    }
+                    errors.add(error);
                 }
             }
         }
-
-        return new ChunkValidationResult(validRows, invalidRows, errors);
     }
+
+    return new ChunkValidationResult(
+            validRows,
+            invalidRows,
+            errors,
+            toPortablePath(validOutputPath),
+            toPortablePath(invalidOutputPath)
+    );
+}
 
 
 
@@ -503,8 +517,8 @@ public class ChunkProcessingService {
     }
 
     private void updateParentJob(UUID jobId) {
-        Job job = jobRepository.findById(jobId)
-                .orElseThrow(() -> new IllegalArgumentException("Job not found: " + jobId));
+        Job job = jobRepository.findByIdForUpdate(jobId)
+            .orElseThrow(() -> new IllegalArgumentException("Job not found: " + jobId));
 
         long completedChunks = jobChunkRepository.countByJobIdAndStatus(jobId, ChunkStatus.COMPLETED);
         long permanentlyFailedChunks = jobChunkRepository.countByJobIdAndStatus(jobId, ChunkStatus.FAILED_PERMANENT);
@@ -537,6 +551,35 @@ public class ChunkProcessingService {
         jobRepository.save(job);
     }
 
+
+    private record ChunkValidationResult(
+        long validRows,
+        long invalidRows,
+        List<ValidationError> errors,
+        String validOutputPath,
+        String invalidOutputPath
+    ) {
+    }
+
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize Kafka message", e);
+        }
+    }
+
+    private String toPortablePath(Path path) {
+        String normalized = path.toString().replace("\\", "/");
+
+        int dataIndex = normalized.indexOf("/data/");
+        if (dataIndex >= 0) {
+            return normalized.substring(dataIndex);
+        }
+
+        return normalized;
+    }
+
     @PostConstruct
     public void initMetrics() {
         this.chunksCompletedCounter = Counter.builder("worker.chunks.completed")
@@ -558,20 +601,5 @@ public class ChunkProcessingService {
         this.chunkProcessingTimer = Timer.builder("worker.chunk.processing.duration")
             .description("Time taken to process a chunk")
             .register(meterRegistry);
-}
-
-    private record ChunkValidationResult(
-            long validRows,
-            long invalidRows,
-            List<ValidationError> errors
-    ) {
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize Kafka message", e);
-        }
     }
 }

@@ -210,21 +210,23 @@ public class JobService {
 
     private JobChunkResponse toJobChunkResponse(JobChunk chunk) {
         return new JobChunkResponse(
-                chunk.getId(),
-                chunk.getJobId(),
-                chunk.getFilePath(),
-                chunk.getChunkFilePath(),
-                chunk.getStartRow(),
-                chunk.getEndRow(),
-                chunk.getStatus(),
-                chunk.getRetryCount(),
-                chunk.getWorkerId(),
-                chunk.getValidRows(),
-                chunk.getInvalidRows(),
-                chunk.getCreatedAt(),
-                chunk.getStartedAt(),
-                chunk.getCompletedAt(),
-                chunk.getLastError()
+            chunk.getId(),
+            chunk.getJobId(),
+            chunk.getFilePath(),
+            chunk.getChunkFilePath(),
+            chunk.getValidOutputPath(),
+            chunk.getInvalidOutputPath(),
+            chunk.getStartRow(),
+            chunk.getEndRow(),
+            chunk.getStatus(),
+            chunk.getRetryCount(),
+            chunk.getWorkerId(),
+            chunk.getValidRows(),
+            chunk.getInvalidRows(),
+            chunk.getCreatedAt(),
+            chunk.getStartedAt(),
+            chunk.getCompletedAt(),
+            chunk.getLastError()
         );
     }
 
