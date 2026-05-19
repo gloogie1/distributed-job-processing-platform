@@ -70,6 +70,7 @@ services:
       SPRING_DATASOURCE_USERNAME: jobuser
       SPRING_DATASOURCE_PASSWORD: jobpass
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      WORKER_TESTING_FORCE_FAILURE_ENABLED: "false"
     volumes:
       - ./sample-data:/data
   

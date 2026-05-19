@@ -18,9 +18,6 @@ Thumbs.db
 *.log
 
 # Data files
-sample-data/*.csv
-sample-data/*.parquet
-sample-data/*.zip
-sample-data/chunks/
-# Local generated files
+sample-data/*
+!sample-data/sample_trips.csv
 *.tmp

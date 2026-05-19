@@ -1,225 +1,371 @@
 # Distributed Job Processing Platform
 
-A Java Spring Boot distributed job-processing platform that splits CSV files into chunks, publishes chunk-processing tasks to Kafka, processes them with horizontally scalable worker instances, and stores job status, chunk status, validation results, retry state, and worker metrics in PostgreSQL.
+A distributed CSV processing platform built with Spring Boot, Apache Kafka, PostgreSQL, Docker, React, Prometheus, and Grafana.
 
-This project is designed as a backend/distributed-systems portfolio project, not a notebook or data-analysis project.
+The system accepts large CSV processing jobs, splits the input into physical chunk files, distributes chunk work across Kafka-backed worker services, validates rows, writes processed output artifacts, tracks job/chunk state in PostgreSQL, and exposes both a React control dashboard and Prometheus/Grafana metrics.
 
-## Tech Stack
+## Project Highlights
 
-- Java 21
-- Spring Boot 3
-- Spring Web
-- Spring Data JPA
-- Spring Kafka
-- PostgreSQL
-- Apache Kafka
-- Docker Compose
-- Maven
-- Spring Boot Actuator
-- Micrometer
+- Distributed worker architecture using Kafka consumer groups
+- PostgreSQL-backed job and chunk state tracking
+- Transactional outbox for reliable DB-to-Kafka chunk dispatch
+- Physical chunk-file processing to avoid repeated full-file scans
+- Retry and DLQ handling for failed chunks
+- Idempotent chunk processing for safe retries/redelivery
+- Per-chunk valid/invalid output files
+- Final merged valid/invalid output artifacts
+- React dashboard for job monitoring and control
+- Prometheus/Grafana monitoring for runtime and worker metrics
+- Benchmarked on a 9.55M-row NYC Yellow Taxi dataset
 
 ## Architecture
 
 ```text
-Client / curl / Postman
-        |
-        v
-Spring Boot API Service
-        |
-        | creates job + chunk metadata
-        v
-PostgreSQL
-        |
-        | publishes chunk messages
-        v
-Kafka topic: job-chunks
-        |
-        | consumed by worker consumer group
-        v
-Spring Boot Worker Service(s)
-        |
-        | validates assigned CSV row ranges
-        | updates chunk/job state
-        | writes validation errors
-        v
-PostgreSQL
+                 ┌──────────────────────┐
+                 │   React Dashboard     │
+                 │   localhost:5173      │
+                 └───────────┬──────────┘
+                             │
+                             v
+┌─────────────────────────────────────────────────────┐
+│                 API Service                         │
+│                                                     │
+│  POST /jobs                                         │
+│   → create job                                      │
+│   → split CSV into physical chunk files             │
+│   → save job_chunks                                 │
+│   → save outbox_events                              │
+└───────────────┬───────────────────────┬─────────────┘
+                │                       │
+                v                       v
+        ┌──────────────┐        ┌─────────────────┐
+        │ PostgreSQL   │        │ Outbox Publisher│
+        │ jobs         │        │ scheduled task  │
+        │ job_chunks   │        └───────┬─────────┘
+        │ outbox_events│                │
+        │ validation   │                v
+        │ errors       │        ┌────────────────┐
+        └──────────────┘        │ Kafka Topics    │
+                                │ job-chunks      │
+                                │ job-chunks-dlq  │
+                                └───────┬────────┘
+                                        │
+                                        v
+                          ┌──────────────────────────┐
+                          │ Worker Services           │
+                          │ 3 Docker replicas         │
+                          │                           │
+                          │ consume chunk messages    │
+                          │ validate rows             │
+                          │ write valid/invalid files │
+                          │ update chunk/job state    │
+                          └───────────┬──────────────┘
+                                      │
+                                      v
+                           ┌──────────────────────┐
+                           │ Output Artifacts      │
+                           │ /data/output/{jobId} │
+                           └──────────────────────┘
 ```
 
-## Services
+## Tech Stack
 
-### API Service
+| Layer | Technology |
+|---|---|
+| API | Spring Boot |
+| Worker services | Spring Boot |
+| Messaging | Apache Kafka |
+| Database | PostgreSQL |
+| Persistence | Spring Data JPA / Hibernate |
+| Observability | Spring Boot Actuator, Micrometer, Prometheus, Grafana |
+| Dashboard | React + Vite |
+| Containerization | Docker Compose |
+| Data format | CSV input/output |
+| Benchmark dataset | NYC Yellow Taxi trip data |
 
-The API service is responsible for:
+## Core Features
 
-- Accepting job submissions
-- Splitting files into row-based chunks
-- Creating job and chunk records in PostgreSQL
-- Publishing chunk messages to Kafka
-- Exposing job status, chunk status, and validation error endpoints
+### Job Creation
 
-Runs on:
+The API accepts a file path and chunk size:
+
+```json
+{
+  "filePath": "/data/yellow_tripdata_2024_q1.csv",
+  "chunkSize": 50000
+}
+```
+
+The API then:
+
+1. Reads the input CSV.
+2. Splits it into physical chunk files under `/data/chunks/{jobId}/`.
+3. Creates a `jobs` record.
+4. Creates `job_chunks` records.
+5. Creates `outbox_events` records.
+6. Returns a running job response.
+
+### Physical Chunk Files
+
+Earlier versions used row ranges where each worker reopened and scanned the original CSV to find its assigned rows. That was inefficient for large files.
+
+The current design creates physical chunk files:
 
 ```text
-http://localhost:8080
+/data/chunks/{jobId}/chunk-000001.csv
+/data/chunks/{jobId}/chunk-000002.csv
+/data/chunks/{jobId}/chunk-000003.csv
 ```
 
-### Worker Service
+Workers now read only their assigned chunk file. This avoids repeated full-file scans and significantly improves throughput.
 
-The worker service is responsible for:
+### Transactional Outbox
 
-- Consuming chunk messages from Kafka
-- Processing assigned row ranges
-- Validating CSV rows
-- Writing validation errors to PostgreSQL
-- Updating chunk/job status
-- Retrying failed chunks
-- Publishing permanently failed chunks to a DLQ
-- Exposing processing metrics through Actuator
+The API does not directly publish Kafka messages during job creation.
 
-Default port:
+Instead, it saves chunk messages into an `outbox_events` table in the same database transaction as the job and chunk records.
 
 ```text
-http://localhost:8081
+single DB transaction:
+  save job
+  save job_chunks
+  save outbox_events
 ```
 
-Multiple worker instances can be started on different ports while sharing the same Kafka consumer group.
+A scheduled publisher then:
 
-## Infrastructure
+```text
+read PENDING outbox events
+publish to Kafka
+mark events SENT
+```
 
-Docker Compose starts:
+This prevents the failure case where job/chunk rows are saved but Kafka publishing fails halfway.
 
-- PostgreSQL
-- Apache Kafka
-- Kafka UI
+### Worker Processing
 
-Kafka UI:
+Workers consume `job-chunks` messages from Kafka.
+
+For each chunk, the worker:
+
+1. Marks the chunk as `PROCESSING`.
+2. Deletes prior validation errors for idempotency.
+3. Validates each row.
+4. Writes valid rows to a per-chunk valid output file.
+5. Writes invalid rows to a per-chunk invalid output file.
+6. Stores sampled validation errors in PostgreSQL.
+7. Marks the chunk as `COMPLETED`.
+8. Updates the parent job.
+
+### Validation Rules
+
+The current row validation checks:
+
+- `passenger_count` must be an integer between 1 and 6
+- `trip_distance` must be greater than 0
+- `fare_amount` must be non-negative
+- `total_amount` must be greater than or equal to `fare_amount`
+- `payment_type` must be an integer between 1 and 6
+- `dropoff_datetime` must be after `pickup_datetime`
+
+Validation errors are capped per chunk to avoid excessive PostgreSQL write amplification on dirty datasets. Aggregate valid/invalid row counts remain accurate.
+
+### Output Artifacts
+
+Workers write per-chunk outputs:
+
+```text
+/data/output/{jobId}/valid/chunk-000001-valid.csv
+/data/output/{jobId}/invalid/chunk-000001-invalid.csv
+```
+
+After all chunks complete, the system enters a finalization phase and creates final merged outputs:
+
+```text
+/data/output/{jobId}/final/valid_rows.csv
+/data/output/{jobId}/final/invalid_rows.csv
+/data/output/{jobId}/final/summary.json
+```
+
+The final summary contains job-level counts and metadata.
+
+Example:
+
+```json
+{
+  "jobId": "5a64d54a-e7a4-48fa-83e1-f7b052c367db",
+  "filePath": "/data/yellow_tripdata_2024_q1.csv",
+  "status": "COMPLETED",
+  "totalChunks": 96,
+  "completedChunks": 96,
+  "failedChunks": 0,
+  "totalRows": 9554778,
+  "validRows": 8480408,
+  "invalidRows": 1074370
+}
+```
+
+### Retry and DLQ
+
+Chunk processing supports retries.
+
+If a chunk fails:
+
+```text
+FAILED_RETRYABLE
+→ retry
+→ retry
+→ retry
+→ FAILED_PERMANENT
+→ job-chunks-dlq
+```
+
+A controlled failure test using a force-fail input verified:
+
+- Failed chunks retried 3 times.
+- Chunks were marked `FAILED_PERMANENT`.
+- Parent job was marked `COMPLETED_WITH_ERRORS`.
+- DLQ messages were published to `job-chunks-dlq`.
+
+### Idempotency
+
+Chunk processing is designed to be safe under retry/redelivery.
+
+Before recomputing a chunk, the worker removes previous validation errors for that chunk and overwrites output files rather than appending to them. This prevents duplicate validation errors or duplicated output rows on Kafka redelivery.
+
+### Parent Job Aggregation
+
+Multiple workers can finish chunks at the same time.
+
+The worker uses a pessimistic lock when updating the parent job row to avoid race conditions where concurrent workers overwrite each other’s aggregate job status. This prevents jobs from getting stuck in `RUNNING` even after all chunks have completed.
+
+## Dashboard
+
+The React dashboard provides application-level visibility.
+
+URL:
+
+```text
+http://localhost:5173
+```
+
+Features:
+
+- Submit jobs
+- View recent jobs
+- View job status and progress
+- View total, valid, and invalid rows
+- View duration and rows/sec
+- View chunk status
+- View worker distribution
+- View validation error samples
+- View output artifact paths
+
+The dashboard is intended as the application control/monitoring plane.
+
+## Kafka UI
+
+Kafka UI is available at:
 
 ```text
 http://localhost:8085
 ```
 
-PostgreSQL:
+Use it to inspect:
+
+- Kafka topics
+- `job-chunks`
+- `job-chunks-dlq`
+- Messages
+- Partitions
+- Consumer groups
+
+## Prometheus and Grafana
+
+Prometheus:
 
 ```text
-host: localhost
-port: 5432
-database: jobsdb
-username: jobuser
-password: jobpass
+http://localhost:9090
 ```
 
-## Kafka Topics
-
-### `job-chunks`
-
-Main topic for chunk-processing work.
-
-The API publishes one message per chunk:
-
-```json
-{
-  "jobId": "7756d8a2-04f4-4439-897d-ade1df0a38ce",
-  "chunkId": "177a9242-01fb-45b4-a700-4c0769e18576",
-  "filePath": "C:\\projects\\distributed-job-processing-platform\\sample-data\\sample_trips.csv",
-  "startRow": 1,
-  "endRow": 2
-}
-```
-
-### `job-chunks-dlq`
-
-Dead-letter topic for chunks that fail permanently after retry exhaustion.
-
-DLQ messages include:
-
-```json
-{
-  "jobId": "...",
-  "chunkId": "...",
-  "filePath": "...",
-  "startRow": 1,
-  "endRow": 2,
-  "retryCount": 3,
-  "errorMessage": "Failed to process chunk",
-  "failedAt": "2026-05-09T21:33:42Z"
-}
-```
-
-## Database Tables
-
-### `jobs`
-
-Stores parent job state:
-
-- Job ID
-- File path
-- Status
-- Total chunks
-- Completed chunks
-- Failed chunks
-- Total rows
-- Valid rows
-- Invalid rows
-- Created/completed timestamps
-
-### `job_chunks`
-
-Stores chunk-level state:
-
-- Chunk ID
-- Job ID
-- File path
-- Start row
-- End row
-- Status
-- Retry count
-- Worker ID
-- Valid row count
-- Invalid row count
-- Error details
-- Started/completed timestamps
-
-### `validation_errors`
-
-Stores row-level validation output:
-
-- Job ID
-- Chunk ID
-- Row number
-- Field name
-- Invalid value
-- Error code
-- Error message
-- Created timestamp
-
-## Job Statuses
+Grafana:
 
 ```text
-PENDING
-RUNNING
-COMPLETED
-COMPLETED_WITH_ERRORS
-FAILED
+http://localhost:3000
 ```
 
-## Chunk Statuses
+Default Grafana login:
 
 ```text
-PENDING
-PROCESSING
-COMPLETED
-FAILED_RETRYABLE
-FAILED_PERMANENT
+username: admin
+password: admin
 ```
 
-## Local Setup
+Prometheus scrapes:
 
-### 1. Start infrastructure
+- API service actuator metrics
+- Worker service actuator metrics
+
+Useful PromQL queries:
+
+```promql
+worker_chunks_completed_total
+```
+
+```promql
+worker_chunks_failed_total
+```
+
+```promql
+worker_rows_validated_total
+```
+
+```promql
+worker_validation_errors_total
+```
+
+```promql
+rate(worker_rows_validated_total[1m])
+```
+
+```promql
+worker_chunk_processing_duration_seconds_sum / worker_chunk_processing_duration_seconds_count
+```
+
+```promql
+jvm_memory_used_bytes
+```
+
+```promql
+hikaricp_connections_active
+```
+
+## Running Locally
+
+### Prerequisites
+
+- Docker Desktop
+- Java 21
+- Maven
+- Node.js / npm
+- Python 3, pandas, pyarrow for preparing the taxi dataset
+
+### Start Backend Stack
 
 ```powershell
 cd C:\projects\distributed-job-processing-platform
-docker compose up -d
+docker compose up -d --build --scale worker-service=3
 ```
+
+This starts:
+
+- PostgreSQL
+- Kafka
+- Kafka UI
+- API service
+- 3 worker service replicas
+- Prometheus
+- Grafana
 
 Check containers:
 
@@ -227,306 +373,358 @@ Check containers:
 docker ps
 ```
 
-Expected containers:
+### Start React Dashboard
+
+```powershell
+cd C:\projects\distributed-job-processing-platform\frontend
+npm.cmd run dev
+```
+
+Open:
 
 ```text
-djp-postgres
-djp-kafka
-djp-kafka-ui
+http://localhost:5173
 ```
 
-### 2. Start API service
+### Stop Backend Stack
 
 ```powershell
-cd C:\projects\distributed-job-processing-platform\api-service
-mvn spring-boot:run
+docker compose down
 ```
 
-Health check:
-
-```text
-http://localhost:8080/actuator/health
-```
-
-### 3. Start worker service
+To also clear PostgreSQL data:
 
 ```powershell
-cd C:\projects\distributed-job-processing-platform\worker-service
-mvn spring-boot:run
+docker compose down -v
 ```
 
-Health check:
+## API Examples
 
-```text
-http://localhost:8081/actuator/health
-```
-
-## Docker Compose Setup
-
-The full system can be started with Docker Compose:
-```powershell
-docker compose up -d --build
-```
-This starts:
-
-PostgreSQL
-Kafka
-Kafka UI
-API service
-Worker service
-
-When using Docker Compose, sample files are mounted into the API and worker containers at:
-```text
-/data
-```
-So job requests should use container paths, for example:
-```powershell
-Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8080/jobs" `
-  -ContentType "application/json" `
-  -Body '{"filePath":"/data/sample_trips.csv","chunkSize":1}'
-```
-Check job status:
-```powershell
-Invoke-RestMethod -Method Get `
-  -Uri "http://localhost:8080/jobs/YOUR_JOB_ID"
-```
-Check chunks:
-```powershell
-Invoke-RestMethod -Method Get `
-  -Uri "http://localhost:8080/jobs/YOUR_JOB_ID/chunks"
-```
-
-## API Endpoints
-
-### Create job
-
-```http
-POST /jobs
-```
-
-Example:
+### Submit Small Sample Job
 
 ```powershell
 Invoke-RestMethod -Method Post `
   -Uri "http://localhost:8080/jobs" `
   -ContentType "application/json" `
-  -Body '{"filePath":"C:\\projects\\distributed-job-processing-platform\\sample-data\\sample_trips.csv","chunkSize":2}'
+  -Body '{"filePath":"/data/sample_trips.csv","chunkSize":4}'
 ```
 
-Example response:
+Expected sample result:
 
 ```text
-id              : 7756d8a2-04f4-4439-897d-ade1df0a38ce
-filePath        : C:\projects\distributed-job-processing-platform\sample-data\sample_trips.csv
-status          : RUNNING
-totalChunks     : 4
-completedChunks : 0
-failedChunks    : 0
-totalRows       : 7
-validRows       : 0
-invalidRows     : 0
-```
-
-### Get job status
-
-```http
-GET /jobs/{jobId}
-```
-
-Example completed response:
-
-```text
-status          : COMPLETED
-totalChunks     : 4
-completedChunks : 4
-failedChunks    : 0
-totalRows       : 7
-validRows       : 2
-invalidRows     : 5
-```
-
-### Get job chunks
-
-```http
-GET /jobs/{jobId}/chunks
-```
-
-Example response:
-
-```text
-startRow    : 1
-endRow      : 2
-status      : COMPLETED
-retryCount  : 0
-workerId    : worker-8081
+totalRows   : 7
 validRows   : 2
-invalidRows : 0
+invalidRows : 5
 ```
 
-### Get validation errors
-
-```http
-GET /jobs/{jobId}/errors
-```
-
-Example response:
-
-```text
-rowNumber    : 3
-fieldName    : dropoff_datetime
-invalidValue : 2024-01-01 11:50:00
-errorCode    : INVALID_TIME_RANGE
-errorMessage : Dropoff datetime must be after pickup datetime
-```
-
-## CSV Validation Rules
-
-The worker validates each row using these rules:
-
-- `pickup_datetime` must be before `dropoff_datetime`
-- `passenger_count` must be between 1 and 6
-- `trip_distance` must be greater than 0
-- `fare_amount` must be non-negative
-- `total_amount` must be greater than or equal to `fare_amount`
-- `payment_type` must be between 1 and 6
-- Rows must contain the expected number of columns
-
-## Fault Tolerance
-
-### Idempotent Chunk Processing
-
-Kafka can redeliver messages. To avoid duplicate work:
-
-- Completed chunks are skipped
-- Permanently failed chunks are skipped
-- Before reprocessing a chunk, existing validation errors for that chunk are deleted
-- Validation output is recomputed for the chunk
-
-This prevents duplicate validation error rows after retries or worker restarts.
-
-### Explicit Retry Handling
-
-The worker handles retries at the application level.
-
-On failure:
-
-```text
-retryCount < 3
-  -> mark chunk FAILED_RETRYABLE
-  -> republish ChunkMessage to job-chunks
-  -> return normally
-
-retryCount >= 3
-  -> mark chunk FAILED_PERMANENT
-  -> publish DlqMessage to job-chunks-dlq
-  -> update parent job
-  -> return normally
-```
-
-This avoids relying on Spring Kafka's automatic retry loop and keeps retry state visible in PostgreSQL.
-
-### Dead Letter Queue
-
-Chunks that fail after the retry limit are published to:
-
-```text
-job-chunks-dlq
-```
-
-This allows failed work to be inspected without blocking the rest of the pipeline.
-
-## Horizontal Worker Scaling
-
-Workers use the same Kafka consumer group:
-
-```text
-job-worker-group
-```
-
-The `job-chunks` topic has 3 partitions, allowing up to 3 workers to process chunks in parallel.
-
-Start multiple workers:
+### Submit Large Taxi Job
 
 ```powershell
-mvn spring-boot:run "-Dspring-boot.run.arguments=--server.port=8081 --worker.instance-id=worker-8081"
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8080/jobs" `
+  -ContentType "application/json" `
+  -Body '{"filePath":"/data/yellow_tripdata_2024_q1.csv","chunkSize":50000}'
 ```
 
-```powershell
-mvn spring-boot:run "-Dspring-boot.run.arguments=--server.port=8082 --worker.instance-id=worker-8082"
-```
-
-```powershell
-mvn spring-boot:run "-Dspring-boot.run.arguments=--server.port=8083 --worker.instance-id=worker-8083"
-```
-
-Each processed chunk records the `workerId`, making worker distribution visible through:
-
-```http
-GET /jobs/{jobId}/chunks
-```
-
-## Observability
-
-The worker exposes custom Micrometer metrics through Spring Boot Actuator.
-
-Metrics endpoint:
-
-```text
-http://localhost:8081/actuator/metrics
-```
-
-Custom metrics:
-
-```text
-worker.chunks.completed
-worker.chunks.failed
-worker.rows.validated
-worker.validation.errors
-worker.chunk.processing.duration
-```
-
-Example:
+### Get Job
 
 ```powershell
 Invoke-RestMethod -Method Get `
-  -Uri "http://localhost:8081/actuator/metrics/worker.chunks.completed"
+  -Uri "http://localhost:8080/jobs/{jobId}"
 ```
+
+### Get Chunks
+
+```powershell
+Invoke-RestMethod -Method Get `
+  -Uri "http://localhost:8080/jobs/{jobId}/chunks"
+```
+
+### Get Validation Errors
+
+```powershell
+Invoke-RestMethod -Method Get `
+  -Uri "http://localhost:8080/jobs/{jobId}/errors"
+```
+
+## Data Preparation
+
+Generated taxi data files are not committed to Git.
+
+The repository keeps only the small sample CSV. Large benchmark datasets should be generated locally.
+
+Ignored generated paths include:
+
+```text
+sample-data/chunks/
+sample-data/output/
+sample-data/*.parquet
+sample-data/*.csv
+```
+
+except:
+
+```text
+sample-data/sample_trips.csv
+```
+
+A Python preparation script is used to download/convert NYC Yellow Taxi parquet data into CSV format compatible with the validator.
 
 Example output:
 
 ```text
-worker.chunks.completed
-COUNT = 7.0
+sample-data/yellow_tripdata_2024_q1.csv
 ```
 
-## Example Metrics Output
+## Benchmark Results
 
-After processing a 7-row sample file:
+### Large Dataset Benchmark
+
+Dataset:
 
 ```text
-worker.chunks.completed        : 7
-worker.rows.validated          : 7
-worker.validation.errors       : 5
-worker.chunk.processing.duration COUNT: 7
+NYC Yellow Taxi multi-month dataset
+Rows: 9,554,778
+Workers: 3 Docker worker replicas
+Chunks: 96
+Chunk size: 50,000
 ```
 
-## Current Limitations
+Observed result:
 
-- API and worker are run manually during development
-- API and worker are not yet Dockerized
-- No transactional outbox yet
-- Kafka publishing happens directly after job/chunk creation
-- No integration tests yet
-- CSV parsing is simple and does not handle quoted commas
-- Benchmarking section is still pending
+| Metric | Value |
+|---|---:|
+| Total rows | 9,554,778 |
+| Valid rows | 8,480,408 |
+| Invalid rows | 1,074,370 |
+| Invalid % | 11.24% |
+| Chunks | 96 |
+| Workers | 3 |
+| Duration | 46s |
+| Throughput | ~207,713 rows/sec |
+| Failed chunks | 0 |
 
-## Planned Improvements
+### Chunk Size Tuning
 
-- Dockerize API and worker services
-- Add benchmark results for 1 vs 2 vs 3 workers
-- Add Transactional Outbox pattern for reliable Kafka publishing
-- Add Testcontainers integration tests
-- Add Prometheus/Grafana dashboard
-- Replace simple CSV parsing with a robust CSV parser
-- Add API pagination for validation errors
+Using the January 2024 NYC Yellow Taxi dataset with 2,964,624 rows and 3 Docker worker replicas:
+
+| Chunk size | Chunks | Duration | Approx throughput |
+|---:|---:|---:|---:|
+| 5,000 | 593 | ~39s | ~76k rows/sec |
+| 10,000 | 297 | ~24–29s | ~102k–124k rows/sec |
+| 20,000 | 149 | ~18s | ~165k rows/sec |
+| 75,000–100,000 | 30–40 | ~15–16s | ~185k–198k rows/sec |
+| 250,000 | 12 | ~14s | ~212k rows/sec |
+| Full file as one chunk | 1 | ~22s | ~135k rows/sec |
+
+Observation:
+
+```text
+Very small chunks increased Kafka/outbox/database/file orchestration overhead.
+One giant chunk removed parallelism.
+Moderately large chunks gave the best balance between parallelism and overhead.
+```
+
+### Worker Scaling
+
+On the larger dataset:
+
+| Setup | Duration |
+|---|---:|
+| 1 worker | ~65s |
+| 3 workers, 50k chunk size | ~52s |
+| 3 workers, 100k/250k chunk size | ~46s |
+| 3 workers, 5k chunk size | ~111s |
+
+Observation:
+
+```text
+Worker scaling improved performance, but chunk size had a major effect.
+Small chunks created too much orchestration overhead.
+Larger chunks improved throughput by reducing per-chunk overhead while preserving enough parallelism.
+```
+
+## Failure Testing
+
+### Worker Kill Test
+
+A worker container was manually killed during a large running job.
+
+Observed behavior:
+
+```text
+Kafka rebalanced partitions.
+Remaining workers continued processing.
+The job completed successfully.
+Failed chunks remained 0.
+```
+
+This demonstrates that worker instance loss does not necessarily fail the job when Kafka can redeliver/reassign work.
+
+### Controlled Failure / DLQ Test
+
+A controlled failure mode was used to force chunk processing exceptions.
+
+Observed behavior:
+
+```text
+2 chunks failed
+each chunk retried 3 times
+both chunks became FAILED_PERMANENT
+parent job became COMPLETED_WITH_ERRORS
+2 messages appeared in job-chunks-dlq
+```
+
+This verifies retry and DLQ behavior.
+
+## Design Evolution
+
+### Version 1: Row Range Chunking
+
+Initial design:
+
+```text
+message = file path + start row + end row
+worker opens original CSV
+worker scans until assigned row range
+```
+
+Problem:
+
+```text
+Workers repeatedly scanned the same large CSV.
+Later chunks required scanning most of the file.
+```
+
+### Version 2: Physical Chunk Files
+
+Improved design:
+
+```text
+API creates physical chunk files
+message = chunk file path
+worker reads only assigned chunk file
+```
+
+Impact:
+
+```text
+Removed repeated full-file scans.
+Improved large-file processing performance.
+```
+
+### Version 3: Validation Error Cap
+
+After physical chunking, the bottleneck shifted to PostgreSQL writes because dirty chunks could produce tens of thousands of validation error rows.
+
+Improvement:
+
+```text
+Store only sampled validation errors per chunk.
+Keep aggregate valid/invalid counts accurate.
+```
+
+Impact:
+
+```text
+Reduced PostgreSQL write amplification.
+Improved worker throughput.
+```
+
+### Version 4: Transactional Outbox
+
+Direct Kafka publishing from job creation could leave the system inconsistent if DB writes succeeded but Kafka publishing failed.
+
+Improvement:
+
+```text
+Save outbox events in the same DB transaction as job/chunk records.
+Publish asynchronously from outbox_events.
+```
+
+Impact:
+
+```text
+Improved reliability of job dispatch.
+Database remains the source of truth for work that still needs to be published.
+```
+
+### Version 5: Final Output Artifacts
+
+Earlier versions tracked metadata and validation results but did not produce final processed datasets.
+
+Improvement:
+
+```text
+Workers write per-chunk valid/invalid outputs.
+Finalizer merges chunk outputs into final valid_rows.csv and invalid_rows.csv.
+```
+
+Impact:
+
+```text
+The platform now produces complete processed output artifacts, not only metadata.
+```
+
+## Repository Notes
+
+Generated datasets and output artifacts are ignored by Git.
+
+Do not commit:
+
+```text
+sample-data/chunks/
+sample-data/output/
+large taxi CSV files
+parquet input files
+frontend/node_modules/
+frontend/dist/
+```
+
+Commit:
+
+```text
+source code
+configuration
+sample_trips.csv
+README
+monitoring configuration
+```
+
+## Future Improvements
+
+Possible next steps:
+
+- Testcontainers integration tests for Kafka/PostgreSQL end-to-end flows
+- Prometheus/Grafana dashboard JSON export
+- Kafka consumer lag endpoint or dashboard panel
+- Flyway database migrations
+- Object storage support for inputs/outputs
+- Final output compression
+- Job cancellation API
+- Re-run failed chunks API
+- Authentication for dashboard/API
+- Worker registry/heartbeat table
+- Kubernetes deployment manifests
+
+## Current Status
+
+The platform currently supports:
+
+```text
+large CSV job submission
+physical chunking
+Kafka-based distributed processing
+transactional outbox dispatch
+multi-worker scaling
+row validation
+retry + DLQ
+idempotent chunk processing
+per-chunk output files
+final merged output files
+React dashboard
+Prometheus/Grafana monitoring
+large-dataset benchmark testing
+manual worker failure testing
+controlled DLQ testing
+```
