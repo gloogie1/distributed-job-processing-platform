@@ -21,7 +21,7 @@ The system accepts large CSV processing jobs, splits the input into physical chu
 - Retry and DLQ handling for failed chunks
 - Idempotent chunk processing for safe retries/redelivery
 - Per-chunk valid/invalid output files
-- Final merged valid/invalid output artifacts
+- Final merged valid/invalid output artifacts for successful jobs
 - React dashboard for job monitoring and control
 - Prometheus/Grafana monitoring for runtime and worker metrics
 - Benchmarked on a 9.55M-row NYC Yellow Taxi dataset
@@ -113,9 +113,13 @@ The API then:
 5. Creates `outbox_events` records.
 6. Returns a running job response.
 
+Job initialization currently performs physical chunk creation inside the `POST /jobs` request. This keeps the implementation simple for local Docker testing, but asynchronous job initialization is listed as a future improvement.
+
 ### Physical Chunk Files
 
-Earlier versions used row ranges where each worker reopened and scanned the original CSV to find its assigned rows. That was inefficient for large files.
+Earlier versions used row ranges where each worker reopened and scanned the original CSV to find its assigned rows.
+
+That was inefficient for large files.
 
 The current design creates physical chunk files:
 
@@ -125,7 +129,9 @@ The current design creates physical chunk files:
 /data/chunks/{jobId}/chunk-000003.csv
 ```
 
-Workers now read only their assigned chunk file. This avoids repeated full-file scans and significantly improves throughput.
+Workers now read only their assigned chunk file.
+
+This avoids repeated full-file scans and significantly improves throughput.
 
 ### Transactional Outbox
 
@@ -149,6 +155,8 @@ mark events SENT
 ```
 
 This prevents the failure case where job/chunk rows are saved but Kafka publishing fails halfway.
+
+This implementation is designed for the local single-API deployment used in this project. A production multi-instance outbox publisher would usually add row claiming or `SKIP LOCKED` semantics to avoid multiple publishers sending the same pending event concurrently.
 
 ### Worker Processing
 
@@ -176,7 +184,11 @@ The current row validation checks:
 - `payment_type` must be an integer between 1 and 6
 - `dropoff_datetime` must be after `pickup_datetime`
 
-Validation errors are capped per chunk to avoid excessive PostgreSQL write amplification on dirty datasets. Aggregate valid/invalid row counts remain accurate.
+The validator is schema-specific and assumes normalized CSV rows for the selected taxi fields. It is not intended to be a fully general CSV parser for arbitrary quoted fields, escaped delimiters, or embedded newlines.
+
+Validation errors are capped per chunk to avoid excessive PostgreSQL write amplification on dirty datasets.
+
+Aggregate valid/invalid row counts remain accurate.
 
 ### Output Artifacts
 
@@ -187,13 +199,15 @@ Workers write per-chunk outputs:
 /data/output/{jobId}/invalid/chunk-000001-invalid.csv
 ```
 
-After all chunks complete, the system enters a finalization phase and creates final merged outputs:
+After all chunks complete successfully, the system enters a finalization phase and creates final merged outputs:
 
 ```text
 /data/output/{jobId}/final/valid_rows.csv
 /data/output/{jobId}/final/invalid_rows.csv
 /data/output/{jobId}/final/summary.json
 ```
+
+If one or more chunks fail permanently, the job is marked `COMPLETED_WITH_ERRORS` and failed chunk details are retained through chunk status, retry count, and DLQ messages instead of producing final merged job-level output files.
 
 The final summary contains job-level counts and metadata.
 
@@ -228,7 +242,7 @@ FAILED_RETRYABLE
 → job-chunks-dlq
 ```
 
-A controlled failure test using a force-fail input verified:
+A controlled failure test using a config-gated force-fail input verified:
 
 - Failed chunks retried 3 times.
 - Chunks were marked `FAILED_PERMANENT`.
@@ -239,13 +253,19 @@ A controlled failure test using a force-fail input verified:
 
 Chunk processing is designed to be safe under retry/redelivery.
 
-Before recomputing a chunk, the worker removes previous validation errors for that chunk and overwrites output files rather than appending to them. This prevents duplicate validation errors or duplicated output rows on Kafka redelivery.
+Before recomputing a chunk, the worker removes previous validation errors for that chunk and overwrites output files rather than appending to them.
+
+This prevents duplicate validation errors or duplicated output rows on Kafka redelivery.
+
+The messaging model is best described as at-least-once delivery with idempotent chunk processing.
 
 ### Parent Job Aggregation
 
 Multiple workers can finish chunks at the same time.
 
-The worker uses a pessimistic lock when updating the parent job row to avoid race conditions where concurrent workers overwrite each other’s aggregate job status. This prevents jobs from getting stuck in `RUNNING` even after all chunks have completed.
+The worker uses a pessimistic lock when updating the parent job row to avoid race conditions where concurrent workers overwrite each other’s aggregate job status.
+
+This prevents jobs from getting stuck in `RUNNING` even after all chunks have completed.
 
 ## Dashboard
 
@@ -674,6 +694,14 @@ Impact:
 The platform now produces complete processed output artifacts, not only metadata.
 ```
 
+## Known Limitations
+
+- Job initialization is synchronous and performs physical chunk creation inside `POST /jobs`.
+- The validator is schema-specific and assumes normalized CSV rows.
+- The transactional outbox publisher is designed for the local single-API deployment used in this project.
+- File-system writes and database writes are not part of a single atomic transaction, so failed runs may leave stale local chunk/output files.
+- Kafka partition count limits the number of actively consuming workers in a consumer group.
+
 ## Repository Notes
 
 Generated datasets and output artifacts are ignored by Git.
@@ -714,6 +742,9 @@ Possible next steps:
 - Authentication for dashboard/API
 - Worker registry/heartbeat table
 - Kubernetes deployment manifests
+- Asynchronous job initialization so `POST /jobs` returns quickly while physical chunk creation runs in the background
+- Outbox row claiming / `SKIP LOCKED` support for multiple API publisher instances
+- Robust CSV parsing using a dedicated CSV parser for quoted fields and escaped delimiters
 
 ## Current Status
 
