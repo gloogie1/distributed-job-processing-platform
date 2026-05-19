@@ -4,6 +4,14 @@ A distributed CSV processing platform built with Spring Boot, Apache Kafka, Post
 
 The system accepts large CSV processing jobs, splits the input into physical chunk files, distributes chunk work across Kafka-backed worker services, validates rows, writes processed output artifacts, tracks job/chunk state in PostgreSQL, and exposes both a React control dashboard and Prometheus/Grafana metrics.
 
+## Performance Snapshot
+
+> **Core benchmark:** Processed **9,554,778 NYC Yellow Taxi rows in 46 seconds** using **3 Docker worker replicas**, **96 chunks**, and final valid/invalid output generation.
+>
+> **Observed throughput:** ~**207,713 rows/sec**
+>
+> **Reliability checks:** Worker-kill testing completed successfully through Kafka consumer-group rebalancing, and controlled failure testing produced `FAILED_PERMANENT` chunks plus DLQ messages in `job-chunks-dlq`.
+
 ## Project Highlights
 
 - Distributed worker architecture using Kafka consumer groups
