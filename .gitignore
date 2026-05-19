@@ -17,7 +17,17 @@ Thumbs.db
 .env
 *.log
 
+# R local history
+.Rhistory
+.RData
+
 # Data files
 sample-data/*
 !sample-data/sample_trips.csv
+
+# Local generated files
 *.tmp
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
