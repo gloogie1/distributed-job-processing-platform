@@ -107,13 +107,16 @@ public class ChunkProcessingService {
         validationErrorRepository.deleteByChunkId(chunk.getId());
 
         try {
+            if (message.filePath().contains("force_fail")) {
+                throw new RuntimeException("Forced failure for DLQ testing");
+            }
             ChunkValidationResult result = processChunkFileWithOutputs(
                 Path.of(message.chunkFilePath()),
                 message.jobId(),
                 message.chunkId(),
                 message.startRow()
             );
-
+            
             chunk.setValidRows(result.validRows());
             chunk.setInvalidRows(result.invalidRows());
             chunk.setValidOutputPath(result.validOutputPath());

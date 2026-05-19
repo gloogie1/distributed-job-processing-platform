@@ -72,8 +72,29 @@ services:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     volumes:
       - ./sample-data:/data
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: djp-prometheus
+    depends_on:
+      - api-service
+      - worker-service
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: djp-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
 
 volumes:
   postgres-data:
-  
+  grafana-data:
 
