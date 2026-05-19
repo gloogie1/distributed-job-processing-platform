@@ -11,6 +11,7 @@ import com.virinchi.workerservice.repository.JobChunkRepository;
 import com.virinchi.workerservice.repository.JobRepository;
 import com.virinchi.workerservice.repository.ValidationErrorRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -34,7 +35,10 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -53,6 +57,9 @@ public class ChunkProcessingService {
     @Value("${worker.instance-id:${HOSTNAME:worker-unknown}}")
     private String workerId;
     
+    @Value("${worker.testing.force-failure-enabled:false}")
+    private boolean forceFailureEnabled;
+
     private static final int MAX_RETRIES = 3;
     private static final int MAX_VALIDATION_ERRORS_PER_CHUNK = 100;
     private static final String JOB_CHUNKS_TOPIC = "job-chunks";
@@ -107,7 +114,7 @@ public class ChunkProcessingService {
         validationErrorRepository.deleteByChunkId(chunk.getId());
 
         try {
-            if (message.filePath().contains("force_fail")) {
+            if (forceFailureEnabled && message.filePath().contains("force_fail")) {
                 throw new RuntimeException("Forced failure for DLQ testing");
             }
             ChunkValidationResult result = processChunkFileWithOutputs(
@@ -533,27 +540,147 @@ public class ChunkProcessingService {
             List<JobChunk> chunks = jobChunkRepository.findByJobId(jobId);
 
             long validRows = chunks.stream()
-                    .mapToLong(JobChunk::getValidRows)
-                    .sum();
+                .mapToLong(JobChunk::getValidRows)
+                .sum();
 
             long invalidRows = chunks.stream()
-                    .mapToLong(JobChunk::getInvalidRows)
-                    .sum();
+                .mapToLong(JobChunk::getInvalidRows)
+            .sum();
 
             job.setValidRows(validRows);
             job.setInvalidRows(invalidRows);
-            job.setCompletedAt(Instant.now());
 
             if (permanentlyFailedChunks > 0) {
                 job.setStatus(JobStatus.COMPLETED_WITH_ERRORS);
+                job.setCompletedAt(Instant.now());
             } else {
+                job.setStatus(JobStatus.FINALIZING);
+                jobRepository.save(job);
+
+                FinalOutputResult finalOutputResult = mergeFinalOutputs(job, chunks);
+
+                job.setValidFinalOutputPath(finalOutputResult.validFinalOutputPath());
+                job.setInvalidFinalOutputPath(finalOutputResult.invalidFinalOutputPath());
+                job.setSummaryOutputPath(finalOutputResult.summaryOutputPath());
                 job.setStatus(JobStatus.COMPLETED);
+                job.setCompletedAt(Instant.now());
             }
         }
+        
 
         jobRepository.save(job);
     }
 
+    private FinalOutputResult mergeFinalOutputs(Job job, List<JobChunk> chunks) {
+        try {
+            List<JobChunk> orderedChunks = chunks.stream()
+                .sorted(Comparator.comparingLong(JobChunk::getStartRow))
+                .toList();
+
+            Path outputBaseDir = resolveOutputBaseDir(orderedChunks);
+            Path finalOutputDir = outputBaseDir.resolve("final");
+
+            Files.createDirectories(finalOutputDir);
+
+            Path validFinalOutputPath = finalOutputDir.resolve("valid_rows.csv");
+            Path invalidFinalOutputPath = finalOutputDir.resolve("invalid_rows.csv");
+            Path summaryOutputPath = finalOutputDir.resolve("summary.json");
+
+            mergeCsvFiles(
+                orderedChunks.stream()
+                        .map(JobChunk::getValidOutputPath)
+                        .toList(),
+                validFinalOutputPath
+            );
+
+            mergeCsvFiles(
+                orderedChunks.stream()
+                        .map(JobChunk::getInvalidOutputPath)
+                        .toList(),
+                invalidFinalOutputPath
+            );
+
+            writeSummaryJson(job, summaryOutputPath);
+
+            return new FinalOutputResult(
+                toPortablePath(validFinalOutputPath),
+                toPortablePath(invalidFinalOutputPath),
+                toPortablePath(summaryOutputPath)
+            );
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to merge final output files for job: " + job.getId(), e);
+        }
+    }
+
+    private Path resolveOutputBaseDir(List<JobChunk> chunks) {
+        return chunks.stream()
+            .map(JobChunk::getValidOutputPath)
+            .filter(path -> path != null && !path.isBlank())
+            .findFirst()
+            .map(path -> Path.of(path).getParent().getParent())
+            .orElseThrow(() -> new IllegalStateException("No valid output path found for final merge"));
+    }
+
+    private void mergeCsvFiles(List<String> inputPaths, Path outputPath) throws IOException {
+        boolean headerWritten = false;
+
+        try (BufferedWriter writer = Files.newBufferedWriter(
+            outputPath,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING
+        )) {
+            for (String inputPath : inputPaths) {
+                if (inputPath == null || inputPath.isBlank()) {
+                    continue;
+                }
+
+                Path path = Path.of(inputPath);
+
+                if (!Files.exists(path)) {
+                    continue;
+                }
+
+                try (BufferedReader reader = Files.newBufferedReader(path)) {
+                    String header = reader.readLine();
+
+                    if (header == null) {
+                        continue;
+                    }
+
+                    if (!headerWritten) {
+                        writer.write(header);
+                        writer.newLine();
+                        headerWritten = true;
+                    }
+
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        writer.write(line);
+                        writer.newLine();
+                    }
+                }
+            }
+        }
+    }
+
+    private void writeSummaryJson(Job job, Path summaryOutputPath) throws IOException {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("jobId", job.getId().toString());
+        summary.put("filePath", job.getFilePath());
+        summary.put("status", "COMPLETED");
+        summary.put("totalChunks", job.getTotalChunks());
+        summary.put("completedChunks", job.getCompletedChunks());
+        summary.put("failedChunks", job.getFailedChunks());
+        summary.put("totalRows", job.getTotalRows());
+        summary.put("validRows", job.getValidRows());
+        summary.put("invalidRows", job.getInvalidRows());
+        summary.put("createdAt", job.getCreatedAt() != null ? job.getCreatedAt().toString() : null);
+        summary.put("completedAt", Instant.now().toString());
+
+        ObjectWriter writer = objectMapper.writerWithDefaultPrettyPrinter();
+        writer.writeValue(summaryOutputPath.toFile(), summary);
+    }
 
     private record ChunkValidationResult(
         long validRows,
@@ -561,6 +688,13 @@ public class ChunkProcessingService {
         List<ValidationError> errors,
         String validOutputPath,
         String invalidOutputPath
+    ) {
+    }
+
+    private record FinalOutputResult(
+        String validFinalOutputPath,
+        String invalidFinalOutputPath,
+        String summaryOutputPath
     ) {
     }
 

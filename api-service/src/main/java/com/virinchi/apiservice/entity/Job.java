@@ -21,6 +21,15 @@ public class Job {
     @Column(nullable = false)
     private String filePath;
 
+    @Column
+    private String validFinalOutputPath;
+
+    @Column
+    private String invalidFinalOutputPath;
+
+    @Column
+    private String summaryOutputPath;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private JobStatus status;

@@ -8,6 +8,9 @@ import java.util.UUID;
 public record JobResponse(
         UUID id,
         String filePath,
+        String validFinalOutputPath,
+        String invalidFinalOutputPath,
+        String summaryOutputPath,
         JobStatus status,
         int totalChunks,
         int completedChunks,

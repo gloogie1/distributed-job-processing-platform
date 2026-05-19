@@ -194,17 +194,20 @@ public class JobService {
 
     private JobResponse toJobResponse(Job job) {
         return new JobResponse(
-                job.getId(),
-                job.getFilePath(),
-                job.getStatus(),
-                job.getTotalChunks(),
-                job.getCompletedChunks(),
-                job.getFailedChunks(),
-                job.getTotalRows(),
-                job.getValidRows(),
-                job.getInvalidRows(),
-                job.getCreatedAt(),
-                job.getCompletedAt()
+            job.getId(),
+            job.getFilePath(),
+            job.getValidFinalOutputPath(),
+            job.getInvalidFinalOutputPath(),
+            job.getSummaryOutputPath(),
+            job.getStatus(),
+            job.getTotalChunks(),
+            job.getCompletedChunks(),
+            job.getFailedChunks(),
+            job.getTotalRows(),
+            job.getValidRows(),
+            job.getInvalidRows(),
+            job.getCreatedAt(),
+            job.getCompletedAt()
         );
     }
 
